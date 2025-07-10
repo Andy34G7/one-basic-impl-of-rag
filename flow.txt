@@ -1,0 +1,25 @@
+This document is used only to maintain/show the flow of the project.
+
+A RAG can be broken down into steps as follows:-
+1. Data ingestion
+    a. Extract Data
+    b. Chunk Data
+    c. Embed data to a vectorDB
+2. Retrieval and Generation
+    a. Recieve and embed user query
+    b. Fetch relevant chunks
+    c. Feeding the prompt to the LLM
+    d. Output the answer
+
+For the purpose of this project, we will be using:-
+1. LlamaParse for extacting data
+2. Recursive Character text splitter from langchain for chunking data
+3. Jina AI to generate the embeddings
+4. pinecone vector db for storing the vector embeddings
+5. Gemini models from google (for the purpose of this particular submission)
+
+Since generating and storing vectors will be a one time process (due to storing the vector embeddings in pinecone's cloud), 
+it makes sense to split the whole project into 3 parts:-
+1. data processing
+2. embeddings
+3. retrieval+Generation
