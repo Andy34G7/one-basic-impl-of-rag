@@ -1,6 +1,7 @@
-llama_parse
-langchain_text_splitters
-dotenv
-pinecone
+streamlit
+llama-parse
+langchain-text-splitters
+python-dotenv
 jinaai
-google.generativeai
+pinecone-client
+google-generativeai
