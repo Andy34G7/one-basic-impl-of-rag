@@ -2,6 +2,6 @@ streamlit
 llama-parse
 langchain-text-splitters
 python-dotenv
-jinaai
 pinecone-client
 google-generativeai
+sentence-transformers

@@ -1,57 +1,72 @@
 import streamlit as st
 import os
-from jinaai import JinaAI
 from pinecone import Pinecone, ServerlessSpec
 import google.generativeai as genai
 from dotenv import load_dotenv
 from llama_parse import LlamaParse
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 import tempfile
+import time
+from sentence_transformers import SentenceTransformer
 
 load_dotenv()
 
 st.set_page_config(
-    page_title="RAG study tool",
+    page_title="RAG Study Tool",
     layout="wide"
 )
 
+LOCAL_EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
+EMBEDDING_DIMENSION = 384 # all-MiniLM-L6-v2 produces 384-dimensional embeddings
+
 @st.cache_resource
 def init_apis():
+    """Initializes all the necessary APIs and clients."""
     try:
         PINECONE_API_KEY = st.secrets["PINECONE_API_KEY"]
-        PINECONE_ENVIRONMENT = st.secrets["PINECONE_ENVIRONMENT"]
         GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
         LLAMAPARSE_API_KEY = st.secrets["LLAMAPARSE_API_KEY"]
-    except:
+    except Exception:
         PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
-        PINECONE_ENVIRONMENT = os.getenv("PINECONE_ENVIRONMENT")
         GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
         LLAMAPARSE_API_KEY = os.getenv("LLAMAPARSE_API_KEY")
+
+    pc = Pinecone(api_key=PINECONE_API_KEY)
     
-    pc = Pinecone(api_key=PINECONE_API_KEY, environment=PINECONE_ENVIRONMENT)
-    jina_ai = JinaAI()
+    local_embedding_model = SentenceTransformer(LOCAL_EMBEDDING_MODEL_NAME)
     
     genai.configure(api_key=GOOGLE_API_KEY)
     gemini_model = genai.GenerativeModel('gemini-2.0-flash')
     
     parser = LlamaParse(api_key=LLAMAPARSE_API_KEY, result_type="markdown")
     
-    return pc, jina_ai, gemini_model, parser
+    return pc, local_embedding_model, gemini_model, parser
 
-def ensure_index_exists(pc, index_name="gdg_rag_index", embedding_dimension=1024):
-    if index_name not in pc.list_indexes():
-        st.info(f"Creating Pinecone index: {index_name}")
-        pc.create_index(
-            name=index_name, 
-            dimension=embedding_dimension, 
-            metric="cosine", 
-            spec=ServerlessSpec(cloud="aws", region="us-east-1")
-        )
-        st.success(f"Created index: {index_name}")
-    return pc.Index(index_name)
+def ensure_index_exists(pc, index_name="gdg-rag-index", embedding_dimension=EMBEDDING_DIMENSION): # Use the defined dimension
+    """Checks if a Pinecone index exists, and creates it if it doesn't."""
+    try:
+        existing_indexes = [index.name for index in pc.list_indexes()]
+        
+        if index_name not in existing_indexes:
+            st.info(f"Creating Pinecone index: {index_name}")
+            pc.create_index(
+                name=index_name, 
+                dimension=embedding_dimension, 
+                metric="cosine", 
+                spec=ServerlessSpec(cloud="aws", region="us-east-1")
+            )
+            st.success(f"Created index: {index_name}. Waiting for it to be ready...")
+            time.sleep(10) # Wait for index to be ready
+        
+        return pc.Index(index_name)
+        
+    except Exception as e:
+        st.error(f"Error with Pinecone index: {str(e)}")
+        return None
 
-def process_and_store_document(file_content, filename, pc, jina_ai, parser):
-    index_name = "gdg_rag_index"
+def process_and_store_document(file_content, filename, pc, local_embedding_model, parser):
+    """Parses, chunks, and stores a document in Pinecone."""
+    index_name = "gdg-rag-index"
     
     with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
         tmp_file.write(file_content)
@@ -59,11 +74,9 @@ def process_and_store_document(file_content, filename, pc, jina_ai, parser):
     
     try:
         st.info(f"Parsing {filename}...")
-        parsed = parser.load_data([tmp_file_path])
+        parsed_docs = parser.load_data([tmp_file_path])
         
-        full_content = ""
-        for doc in parsed:
-            full_content += doc.page_content + "\n\n"
+        full_content = "".join([doc.text + "\n\n" for doc in parsed_docs])
         
         chunker = RecursiveCharacterTextSplitter(
             chunk_size=1000, 
@@ -75,34 +88,39 @@ def process_and_store_document(file_content, filename, pc, jina_ai, parser):
         
         st.info(f"Created {len(chunks)} chunks from {filename}")
         
-        all_chunks = []
+        all_chunks_to_upsert = []
         for i, chunk in enumerate(chunks):
-            chunk_id = f"{filename.replace('.pdf', '')}_chunk_{i}"
-            all_chunks.append({
+            safe_filename = "".join(c for c in filename if c.isalnum() or c in ('-', '_')).rstrip()
+            chunk_id = f"{safe_filename}_chunk_{i}"
+            all_chunks_to_upsert.append({
                 "id": chunk_id,
                 "text": chunk.page_content,
                 "metadata": {
                     "source": filename,
                     "chunk_index": i,
-                    "text": chunk.page_content
+                    "text": chunk.page_content # Store full text in metadata for easy retrieval
                 }
             })
         
         index = ensure_index_exists(pc)
+        if index is None:
+            st.error("Failed to create or access Pinecone index.")
+            return False
         
         batch_size = 100
         total_uploaded = 0
         
-        progress_bar = st.progress(0)
-        for i in range(0, len(all_chunks), batch_size):
-            batch = all_chunks[i:i + batch_size]
+        progress_bar = st.progress(0, text=f"Embedding and upserting {len(all_chunks_to_upsert)} chunks...")
+        for i in range(0, len(all_chunks_to_upsert), batch_size):
+            batch = all_chunks_to_upsert[i:i + batch_size]
             
             texts = [item["text"] for item in batch]
-            embeddings_response = jina_ai.embed(texts=texts)
+            
+            embeddings = local_embedding_model.encode(texts, convert_to_numpy=True).tolist() # Ensure list format for Pinecone
             
             vectors = []
             for j, item in enumerate(batch):
-                embedding = embeddings_response['data'][j]['embedding']
+                embedding = embeddings[j]
                 vectors.append({
                     "id": item["id"],
                     "values": embedding,
@@ -112,9 +130,9 @@ def process_and_store_document(file_content, filename, pc, jina_ai, parser):
             index.upsert(vectors=vectors)
             total_uploaded += len(batch)
             
-            progress_bar.progress(total_uploaded / len(all_chunks))
+            progress_bar.progress(total_uploaded / len(all_chunks_to_upsert), text=f"Upserted {total_uploaded}/{len(all_chunks_to_upsert)} chunks")
         
-        st.success(f"Successfully processed and stored {filename} ({len(all_chunks)} chunks)")
+        st.success(f"Successfully processed and stored {filename} ({len(all_chunks_to_upsert)} chunks)")
         return True
         
     except Exception as e:
@@ -124,131 +142,137 @@ def process_and_store_document(file_content, filename, pc, jina_ai, parser):
         if os.path.exists(tmp_file_path):
             os.unlink(tmp_file_path)
 
-def query_rag(query, pc, jina_ai, gemini_model, top_k=3):
-    PINECONE_INDEX_NAME = "gdg_rag_index"
+def query_rag(query, pc, local_embedding_model, gemini_model, top_k=3):
+    """Queries the RAG system to get an answer for a given query."""
+    PINECONE_INDEX_NAME = "gdg-rag-index"
     
-    query_embed = jina_ai.embed_text(query)
-    
-    index = pc.Index(PINECONE_INDEX_NAME)
-    search_results = index.query(vector=query_embed, top_k=top_k, include_metadata=True)
-    
-    context = []
-    if search_results.matches:
-        for match in search_results.matches:
-            chunk_content = match.metadata.get('text', 'No content found for this chunk.')
-            source_file = match.metadata.get('source', 'Unknown source')
-            chunk_index = match.metadata.get('chunk_index', 'N/A')
-            context.append(f"--- Document: {source_file}, Chunk: {chunk_index} ---\n{chunk_content}")
-        context_str = "\n\n".join(context)
-    else:
-        context_str = "No relevant chunks found."
-    
-    prompt = f"""You are a helpful assistant. Use the following context to answer the user's query.
-    {context_str}
+    try:
+        query_embed = local_embedding_model.encode(query, convert_to_numpy=True).tolist()
+        
+        index = pc.Index(PINECONE_INDEX_NAME)
+        search_results = index.query(vector=query_embed, top_k=top_k, include_metadata=True)
+        
+        context_parts = []
+        if search_results.matches:
+            for match in search_results.matches:
+                chunk_content = match.metadata.get('text', 'No content found.')
+                source_file = match.metadata.get('source', 'Unknown source')
+                context_parts.append(f"--- From: {source_file} (Score: {match.score:.2f}) ---\n{chunk_content}") # Added score to context
+            context_str = "\n\n".join(context_parts)
+        else:
+            context_str = "No relevant information found in the documents."
+        
+        prompt = f"""You are a helpful assistant. Use the following context to answer the user's query.
+        If the context does not contain the answer, state that you could not find the information in the provided documents.
 
-    User's query: {query}
-    Answer the query based on the context provided."""
+        Context:
+        {context_str}
+
+        User's query: {query}
+        Answer:"""
+        
+        response = gemini_model.generate_content(prompt)
+        return response.text, search_results.matches
     
-    response = gemini_model.generate_content(prompt)
-    return response.text, search_results.matches
+    except Exception as e:
+        st.error(f"Error during query: {str(e)}")
+        return "Sorry, I encountered an error while processing your query.", []
 
 def generate_related_links(topic, context, gemini_model):
-    prompt = f"""Based on the topic "{topic}" and the following document context, generate 10 educational links that would be useful for studying this topic. Include a mix of educational websites, courses, tutorials, and resources.
+    """Generates educational links based on a topic and context."""
+    prompt = f"""Based on the topic "{topic}" and the provided document context, generate up to 5 relevant educational links.
 
     Document context:
     {context[:2000]}
 
-    Please provide 10 links in the following format:
+    Provide links in the format:
     1. [Link Title](https://example.com) - Brief description
-    2. [Link Title](https://example.com) - Brief description
-    ...and so on.
-
-    Focus on reputable educational sources like Khan Academy, Coursera, edX, MIT OpenCourseWare, Wikipedia, academic institutions, and other reliable learning platforms.
     """
     
-    response = gemini_model.generate_content(prompt)
-    return response.text
+    try:
+        response = gemini_model.generate_content(prompt)
+        return response.text
+    except Exception as e:
+        st.error(f"Error generating links: {str(e)}")
+        return "Sorry, I couldn't generate study links."
 
 def main():
-    st.title("RAG Study Tool")
+    """Main function to run the Streamlit app."""
+    st.title("RAG Study Tool (Local Embeddings)") # Updated title
     st.markdown("Upload documents and get answers to your questions!")
     
     try:
-        pc, jina_ai, gemini_model, parser = init_apis()
+        pc, local_embedding_model, gemini_model, parser = init_apis()
     except Exception as e:
-        st.error(f"Failed to initialize APIs: {str(e)}")
+        st.error(f"Failed to initialize APIs. Please check your environment variables. Error: {str(e)}")
         st.stop()
     
     with st.sidebar:
         st.header("Settings")
         top_k = st.slider("Number of chunks to retrieve", min_value=1, max_value=10, value=3)
+        st.info(f"Using local embedding model: `{LOCAL_EMBEDDING_MODEL_NAME}` (Dimension: {EMBEDDING_DIMENSION})") # Info about local model
         
         st.header("Index Stats")
         try:
-            index = pc.Index("gdg_rag_index")
-            stats = index.describe_index_stats()
-            st.metric("Total Vectors", stats.total_vector_count)
+            index_name = "gdg-rag-index"
+            existing_indexes = [index.name for index in pc.list_indexes()]
+            if index_name in existing_indexes:
+                index = pc.Index(index_name)
+                stats = index.describe_index_stats()
+                st.metric("Total Vectors", stats.total_vector_count)
+            else:
+                st.info("Index not created yet.")
         except Exception as e:
-            st.error(f"Error loading index stats: {str(e)}")
+            st.error(f"Could not load index stats: {str(e)}")
     
     tab1, tab2, tab3 = st.tabs(["Chat", "Upload Documents", "Study Links"])
     
     with tab2:
         st.header("Upload PDF Documents")
-        st.markdown("Upload PDF files")
-        
         uploaded_files = st.file_uploader(
             "Choose PDF files",
             type=['pdf'],
             accept_multiple_files=True,
-            help="Select one or more PDF files to upload and process"
+            help="Select one or more PDF files to upload and process."
         )
         
         if uploaded_files:
             if st.button("Process Documents", type="primary"):
-                success_count = 0
-                
-                for uploaded_file in uploaded_files:
-                    file_content = uploaded_file.read()
-                    filename = uploaded_file.name
+                with st.spinner("Processing documents... This may take a while."):
+                    success_count = 0
+                    for uploaded_file in uploaded_files:
+                        file_content = uploaded_file.read()
+                        if process_and_store_document(file_content, uploaded_file.name, pc, local_embedding_model, parser):
+                            success_count += 1
                     
-                    if process_and_store_document(file_content, filename, pc, jina_ai, parser):
-                        success_count += 1
-                
-                if success_count > 0:
-                    st.success(f"Successfully processed {success_count} out of {len(uploaded_files)} documents!")
-                    st.balloons()
-                else:
-                    st.error("Failed to process any documents. Please check your files and try again.")
+                    if success_count > 0:
+                        st.success(f"Successfully processed {success_count}/{len(uploaded_files)} documents!")
+                        st.balloons()
+                    else:
+                        st.error("Failed to process any documents.")
     
     with tab3:
         st.header("Generate Study Links")
-        st.markdown("Get related educational links based on your study topic")
-        
-        topic = st.text_input("What topic would you like to study?", 
-                             placeholder="e.g., Machine Learning, Physics, History, etc.")
+        topic = st.text_input("Enter a topic to get related study links:", placeholder="e.g., Machine Learning")
         
         if st.button("Generate Links", type="primary") and topic:
-            with st.spinner("Generating related study links..."):
+            with st.spinner("Generating links..."):
                 try:
-                    index = pc.Index("gdg_rag_index")
-                    topic_embed = jina_ai.embed_text(topic)
-                    search_results = index.query(vector=topic_embed, top_k=5, include_metadata=True)
-                    
-                    context = ""
-                    if search_results.matches:
-                        for match in search_results.matches:
-                            chunk_content = match.metadata.get('text', '')
-                            context += chunk_content + "\n\n"
-                    
-                    links = generate_related_links(topic, context, gemini_model)
-                    
-                    st.subheader(f"Study Links for: {topic}")
-                    st.markdown(links)
-                    
+                    index_name = "gdg-rag-index"
+                    if index_name not in [index.name for index in pc.list_indexes()]:
+                        st.warning("Please upload documents first to provide context for link generation.")
+                    else:
+                        index = pc.Index(index_name)
+                        topic_embed = local_embedding_model.encode(topic, convert_to_numpy=True).tolist()
+                        search_results = index.query(vector=topic_embed, top_k=5, include_metadata=True)
+                        
+                        context = "".join([match.metadata.get('text', '') + "\n\n" for match in search_results.matches])
+                        links = generate_related_links(topic, context, gemini_model)
+                        st.subheader(f"Study Links for: {topic}")
+                        st.markdown(links)
                 except Exception as e:
                     st.error(f"Error generating links: {str(e)}")
-    
+
     with tab1:
         st.header("Ask Questions")
         
@@ -258,40 +282,36 @@ def main():
         for message in st.session_state.messages:
             with st.chat_message(message["role"]):
                 st.markdown(message["content"])
-                if message["role"] == "AI" and "sources" in message:
+                if message["role"] == "AI" and "sources" in message and message["sources"]:
                     with st.expander("View Sources"):
                         for i, source in enumerate(message["sources"]):
-                            st.write(f"**Source {i+1}** (Score: {source.score:.3f})")
-                            st.write(f"Document: {source.metadata.get('source', 'Unknown')}")
-                            st.write(f"Chunk: {source.metadata.get('chunk_index', 'N/A')}")
-                            st.write(f"Content: {source.metadata.get('text', 'No content')[:200]}...")
-                            st.divider()
+                            st.info(f"**Source {i+1}** (Score: {source.score:.2f}) - *{source.metadata.get('source', 'N/A')}*")
+                            st.markdown(f"> {source.metadata.get('text', 'No content')[:250]}...")
         
-        if prompt := st.chat_input("What would you like to know?"):
+        if prompt := st.chat_input("Ask about your documents..."):
             st.session_state.messages.append({"role": "user", "content": prompt})
             with st.chat_message("user"):
                 st.markdown(prompt)
             
             with st.chat_message("AI"):
-                with st.spinner("Generating response..."):
+                with st.spinner("Thinking..."):
                     try:
-                        response, matches = query_rag(prompt, pc, jina_ai, gemini_model, top_k)
-                        st.markdown(response)
-                        
-                        st.session_state.messages.append({
-                            "role": "AI", 
-                            "content": response,
-                            "sources": matches
-                        })
-                        
+                        index_name = "gdg-rag-index"
+                        if index_name not in [index.name for index in pc.list_indexes()]:
+                            error_msg = "No documents uploaded. Please upload documents in the 'Upload' tab first."
+                            st.error(error_msg)
+                            st.session_state.messages.append({"role": "AI", "content": error_msg})
+                        else:
+                            response, matches = query_rag(prompt, pc, local_embedding_model, gemini_model, top_k)
+                            st.markdown(response)
+                            st.session_state.messages.append({"role": "AI", "content": response, "sources": matches})
                     except Exception as e:
-                        error_msg = f"Error: {str(e)}"
+                        error_msg = f"An error occurred: {str(e)}"
                         st.error(error_msg)
                         st.session_state.messages.append({"role": "AI", "content": error_msg})
         
-        col1, col2 = st.columns([1, 4])
-        with col1:
-            if st.button("Clear Chat"):
+        if len(st.session_state.messages) > 0:
+            if st.button("Clear Chat History"):
                 st.session_state.messages = []
                 st.rerun()
 
