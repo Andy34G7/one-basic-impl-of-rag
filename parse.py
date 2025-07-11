@@ -54,11 +54,11 @@ PINECONE_ENVIRONMENT = os.getenv("PINECONE_ENVIRONMENT")
 
 pc = Pinecone(api_key=PINECONE_API_KEY, environment=PINECONE_ENVIRONMENT)
 index_name = "gdg_rag_index"
-embedding_dimension = 768
+embedding_dimension = 1024
 
 if index_name not in pc.list_indexes():
     print(f"Now creating pinecone index with name {index_name}")
-    pc.create_index(index_name=index_name, dimension=embedding_dimension, metric="cosine", serverless_spec=ServerlessSpec())
+    pc.create_index(name=index_name, dimension=embedding_dimension, metric="cosine", spec=ServerlessSpec(cloud="aws",region="us-east-1"))
 else:
     print(f"Pinecone index with name {index_name} already exists")
 
