@@ -1,0 +1,5 @@
+llama_parse
+langchain_text_splitters
+dotenv
+pinecone
+jinaai
