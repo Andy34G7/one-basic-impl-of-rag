@@ -3,3 +3,4 @@ langchain_text_splitters
 dotenv
 pinecone
 jinaai
+google.generativeai
